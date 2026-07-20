@@ -1,0 +1,6 @@
+.env
+agri_price_1year.csv
+__pycache__/
+*.pyc
+.venv/
+*.py[cod]
