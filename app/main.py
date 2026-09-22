@@ -3,13 +3,23 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.db import connect_db, disconnect_db
 from app.api import farms, crops, logs, solar_term
+from apscheduler.schedulers.background import BackgroudnScheduler
+from app.scheduler import update_daily_gdd_job
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 서버 시작 시 DB 연결
     await connect_db()
+
+    # 매일 새벽 3시 GDD 계산 백그라운드 스케줄러 시작
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(update_daily_gdd_job, 'cron', hour=3, minute=0)
+    scheduler.start()
+
     yield
-    # 서버 종료 시 DB 연결 해제
+    
+    # 서버 종료 시 DB 연결 해제 및 스케줄러 종료
+    scheduler.shutdown()
     await disconnect_db()
 
 app = FastAPI(
