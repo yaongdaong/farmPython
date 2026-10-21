@@ -5,15 +5,24 @@ from pathlib import Path
 import re
 from typing import List, Optional, Dict, Any
 from urllib.parse import unquote
-
+import math
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import numpy as np
 import pandas as pd
-from pydantic import BaseModel
+from pydantic import BaseModel,Field
 import joblib
+import logging
+from fastapi import FastAPI, HTTPException, status, Depends
+from fastapi.middleware.cors import CORSMiddleware
+
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.models import Crop,Farm, FarmLog, Prediction, Harvest
+logger = logging.getLogger(__name__)
 
 try:
     import torch
@@ -117,47 +126,74 @@ predictor = WeatherPredictorEngine(MODEL_PATH)
 
 # --- 2. Request / Response Pydantic 모델 ---
 class WeatherInfo(BaseModel):
-    temp: float
-    avg_temp: Optional[float] = None
-    humidity: int
-    rain: float
-    sky: str
-    solHours: float = 0.0
+    date: Optional[str] = Field(None, description="날짜 (YYYY-MM-DD)")
+    temp: float = Field(..., description="현재 기온")
+    avg_temp: Optional[float] = Field(None, description="일평균 기온")
+    humidity: int = Field(..., description="습도 (%)")
+    rain: float = Field(..., description="강수량 (mm)")
+    sky: str = Field(..., description="날씨 상태")
+    solHours: float = Field(0.0, description="일조시간 (시간)")
 
 
 class WeatherRequest(BaseModel):
     location_str: str
 
-
-class CropAnalysisRequest(BaseModel):
+# 2. CropAnalysisSchema 정의 (에러 해결)
+class CropAnalysisSchema(BaseModel):
+    crop_id: str
     crop_name: str
-    area_pyeong: float
-    status_type: str  # "growing" | "planned"
-    location_str: str
-    plant_date: Optional[str] = None
-    recent_weather: Optional[List[WeatherInfo]] = None
-    previous_expected_harvest_date: Optional[str] = None  # 이전 예측일 (이벤트 트리거 비교용)
+    plant_date: str
+    target_gdd: Optional[float] = 1200.0
+    base_temp: Optional[float] = 10.0
+    recent_weather: Optional[List[WeatherInfo]] = []
+    
+class CropAnalysisRequest(BaseModel):
+    crop_name: str = Field(..., description="작물 이름")
+    area_pyeong: float = Field(100.0, description="재배 면적 (평)")
+    status_type: str = Field("growing", description="재배 상태 ('planned': 계획 중, 'growing': 재배 중)")
+    location_str: Optional[str] = Field("서울", description="지역명 또는 주소")
+    target_gdd: float = Field(..., description="목표 적산온도")
+    plant_date: str = Field(..., description="정식일/파종일 (YYYY-MM-DD)")
+    base_temp: float = Field(..., description="생육 하한온도 (Base Temperature)")
+    recent_weather: List[WeatherInfo] = Field(default=[], description="과거/최근 기상 기록 (FarmLog 연동 데이터)")
+    previous_expected_harvest_date: Optional[str] = Field(None, description="이전 예측 수확일 (YYYY-MM-DD)")
 
+class FertilizerScheduleItem(BaseModel):
+    stage: str
+    recommended_date: str
+    item_name: str
+    amount_kg: float
+
+class NotificationTrigger(BaseModel):
+    triggered: bool
+    diff_days: int
+    message: str
+    action: str
 
 class FertilizerRecommendation(BaseModel):
     stage: str
     recommended_date: str
     item_name: str
-    amount_kg: float
+    fertilizer_type: str
+    amount_kg_per_10a: float
+    description: str
 
 
 class CropAnalysisResponse(BaseModel):
     crop_name: str
     crop_category: str
     accuracy_range: str
-    accumulated_temp: float
+    accumulated_gdd: float                   # 누적 적산온도 (수정)
     target_accumulated_temp: float
-    expected_harvest_date: str
-    harvest_buffer_range: str  # 쇼핑몰/문자 발송용 버퍼 기간 (예: 06월 20일 ~ 06월 22일)
+    today_effective_gdd: float
+    gdd_progress_percent: float
+    estimated_harvest_date: str             # 예상 수확일 (수정)
+    harvest_buffer_range: str
     expected_yield_kg: float
-    fertilizer_schedule: List[FertilizerRecommendation]
-    notification_trigger: Optional[Dict[str, Any]] = None  # 일정 보정 알림 이벤트
-    analysis_report: str
+    fertilizer_schedule: List[FertilizerScheduleItem]
+    fertilizer_recommendation: Optional[FertilizerRecommendation] = None # Optional 추가
+    notification_trigger: Optional[NotificationTrigger] = None 
+    analysis_report: Optional[str] = None    # 리포트 문자열 추가
     weather: WeatherInfo
 
 
@@ -249,9 +285,11 @@ def get_ultrasrt_datetime():
 def get_vilage_datetime():
     now = datetime.now()
     check_time = now - timedelta(minutes=20)
-    current_hour = check_time.hour
-    issue_times = [2, 5, 8, 11, 14, 17, 20, 23]
-    past_times = [t for t in issue_times if t <= current_hour]
+    current_hour = check_time.hour     
+
+    # 기상청 단기예보 Base_time 목록
+    base_times = [2,5,8,11,14,17,20,23]
+    past_times = [t for t in base_times if t <= current_hour]   
 
     if past_times:
         base_hour = max(past_times)
@@ -261,6 +299,49 @@ def get_vilage_datetime():
         base_date = (check_time - timedelta(days=1)).strftime("%Y%m%d")
 
     return base_date, f"{base_hour:02d}00"
+
+def calculate_daily_gdd(avg_temp: float, base_temp: float) -> float:
+    """유효 적산온도(GDD) 계산"""
+    return max(0.0, avg_temp - base_temp)
+
+# 비료 추천 및 분석 로직
+def get_fertilizer_recommendation(progress_percent: float) -> FertilizerRecommendation:
+    if progress_percent < 25.0:
+        return FertilizerRecommendation(
+            stage="기비 (초기 생육기)",
+            recommended_date="현재",
+    item_name="복합비료",
+            fertilizer_type="밑거름 (N-P-K 복합비료)",
+            amount_kg_per_10a=20.0,
+            description="뿌리 자람을 촉진하기 위해 질소와 인산 함량이 높은 비료를 시비하세요."
+        )
+    elif progress_percent < 60.0:
+        return FertilizerRecommendation(
+            stage="추비 1차 (영양 생장기)",
+            recommended_date="현재",
+            item_name="복합비료",
+            fertilizer_type="요소 비료 및 칼륨 비료",
+            amount_kg_per_10a=10.0,
+            description="줄기와 잎의 성장 촉진을 위해 웃거름을 1차 시비하세요."
+        )
+    elif progress_percent < 85.0:
+        return FertilizerRecommendation(
+            stage="추비 2차 (생식 생장기)",
+            recommended_date="현재",
+            item_name="복합비료",
+            fertilizer_type="황산가리 및 칼슘 비료",
+            amount_kg_per_10a=8.0,
+            description="과실 품질 향상 및 세포벽 강화를 위해 칼슘과 가리를 보충하세요."
+        )
+    else:
+        return FertilizerRecommendation(
+            stage="수확 준비기",
+            recommended_date="현재",
+            item_name="복합비료",
+            fertilizer_type="시비 중단",
+            amount_kg_per_10a=0.0,
+            description="수확 전 착색 및 당도 증진을 위해 질소질 비료 시비를 중단하세요."
+        )
 
 
 async def fetch_weather_data(nx: int, ny: int) -> dict:
@@ -368,6 +449,82 @@ app.add_middleware(
 
 
 # --- 6. API Endpoints ---
+# FastAPI 백엔드 예시 (GET /api/farm-list)
+@app.get("/api/farm-list")
+async def get_farm_list(db: Session = Depends(get_db)):
+
+    # 각 Farm별 가장 최근 영농일지 1개를 찾기 위한 서브쿼리
+    latest_journal = (
+        db.query(
+            FarmLog.farmId,
+            FarmLog.growthStage,
+            FarmLog.createdAt
+        )
+        .order_by(FarmLog.farmId, FarmLog.createdAt.desc())
+        .subquery()
+    )
+
+    # Farm + 최근 영농일지 생육상태 조회
+    farms = (
+        db.query(
+            Farm,
+            latest_journal.c.growthStage
+        )
+        .outerjoin(
+            latest_journal,
+            Farm.id == latest_journal.c.farmId
+        )
+        .all()
+    )
+
+    return [
+        {
+            # Farm 기본정보
+            "id": str(farm.id),
+            "name": farm.name,
+            "address": farm.address,
+            "actualArea": farm.actualArea,
+            "totalArea": farm.totalArea,
+
+            # 날짜
+            "plantDate": (
+                farm.plantDate.isoformat()
+                if farm.plantDate
+                else ""
+            ),
+
+            "bloomDate": (
+                farm.bloomDate.isoformat()
+                if farm.bloomDate
+                else None
+            ),
+
+            # 상태
+            "statusType": farm.statusType,
+
+            # 최근 영농일지의 생육상태가 있으면 사용
+            # 없으면 Farm에 저장된 기본 상태 사용
+            "growthStatus": (
+                growthStage
+                if growthStage
+                else farm.growthStatus or "영농생장기"
+            ),
+
+            # 적산온도 / GDD
+            "accumulatedTemp": farm.accumulatedTemp,
+            "targetTemp": farm.targetTemp,
+            "baseTemp": farm.baseTemp,
+            "targetGdd": farm.targetGdd,
+
+            # 시설
+            "facilityType": farm.facilityType,
+
+            # aiReport는 여기서 가져오지 않음
+            # /api/analyze-crop에서 현재 기준으로 계산
+        }
+        for farm, growthStage in farms
+    ]
+
 @app.post("/api/weather", response_model=WeatherInfo)
 async def get_current_weather(req: WeatherRequest):
     nx, ny, _ = get_grid_coords(req.location_str)
@@ -381,72 +538,92 @@ async def get_current_weather(req: WeatherRequest):
         solHours=0.0,
     )
 
+# 💡 Next.js에서 호출하는 경로(@app.post("/api/crop-analysis"))가 맞는지 확인
+@app.post("/api/crop-analysis")
+async def analyze_crop(payload: CropAnalysisSchema):
+    return {"status": "success", "data": ...}
+
 
 @app.post("/api/analyze-crop", response_model=CropAnalysisResponse)
 async def analyze_crop(req: CropAnalysisRequest):
-    nx, ny, region_name = get_grid_coords(req.location_str)
-    weather = await fetch_weather_data(nx, ny)
-    
-    current_weather = WeatherInfo(
-        temp=weather["current_temp"],
-        avg_temp=weather["avg_temp"],
-        humidity=weather["humidity"],
-        rain=weather["rain"],
-        sky=weather["sky"],
-        solHours=0.0,
-    )
-
-    crop_spec = get_crop_spec(req.crop_name)
-    crop_key = next((k for k in CROP_TEMP_MASTER.keys() if k in req.crop_name), "default")
-    fert_spec = FERTILIZER_MASTER_100_PYEONG.get(crop_key, FERTILIZER_MASTER_100_PYEONG["default"])
-
-    base_temp = crop_spec["base_temp"]
-    target_temp = crop_spec["target_temp"]
-    crop_category = crop_spec["category"]
-    buffer_days = crop_spec["buffer_days"]
-
-    today_effective_gdd = max(0.0, weather["avg_temp"] - base_temp)
-    expected_yield = round(req.area_pyeong * crop_spec["yield_per_pyeong"], 1)
-
-    if req.status_type == "planned":
-        recommended_plant_date = "3월 하순"
-        expected_harvest_period = "6월 하순 ~ 7월 초순"
-
-        report = (
-            f"📅 [최적 식재 시기 및 기상 분석 리포트 - {region_name}]\n"
-            f"• 선택 작물: {req.crop_name} ({crop_category}, 예측 정확도: {crop_spec['accuracy']})\n"
-            f"• 현재 지역 일평균 기온: {weather['avg_temp']:.1f}℃ (오늘 유효 GDD: +{today_effective_gdd:.1f}℃/일)\n"
-            f"• 추천 식재 타이밍: [{recommended_plant_date}] (경락 최고가 시기 역산)\n"
-            f"• 예상 수확 시기: {expected_harvest_period}\n"
-            f"• 예상 총 수확량: 약 {expected_yield}kg"
+    try:
+        # 1. 위치 기반 실시간 기상 데이터 수집
+        nx, ny, region_name = get_grid_coords(req.location_str)
+        weather_data = await fetch_weather_data(nx, ny)
+        
+        current_weather = WeatherInfo(
+            date=datetime.now().strftime("%Y-%m-%d"),
+            temp=weather_data["current_temp"],
+            avg_temp=weather_data["avg_temp"],
+            humidity=weather_data["humidity"],
+            rain=weather_data["rain"],
+            sky=weather_data["sky"],
+            solHours=weather_data.get("solHours", 8.0)
         )
 
-        return CropAnalysisResponse(
-            crop_name=req.crop_name,
-            crop_category=crop_category,
-            accuracy_range=crop_spec["accuracy"],
-            accumulated_temp=0.0,
-            target_accumulated_temp=target_temp,
-            expected_harvest_date=expected_harvest_period,
-            harvest_buffer_range=expected_harvest_period,
-            expected_yield_kg=expected_yield,
-            fertilizer_schedule=[],
-            notification_trigger=None,
-            analysis_report=report,
-            weather=current_weather,
-        )
+        # 2. 작물 마스터 마스터 정보 및 시비 정보 조회
+        crop_spec = get_crop_spec(req.crop_name)
+        crop_key = next((k for k in CROP_TEMP_MASTER.keys() if k in req.crop_name), "default")
+        fert_spec = FERTILIZER_MASTER_100_PYEONG.get(crop_key, FERTILIZER_MASTER_100_PYEONG["default"])
 
-    else:
-        # 1. 과거 적산온도 누적 및 일조량/강수량 환경 보정 지연일 산출
+        base_temp = crop_spec["base_temp"]
+        target_temp = crop_spec["target_temp"]
+        crop_category = crop_spec["category"]
+        buffer_days = crop_spec.get("buffer_days", 3)
+
+        # 오늘 유효 GDD 및 예상 수확량 계산
+        current_avg_temp = weather_data["avg_temp"]
+        today_effective_gdd = max(0.0, current_avg_temp - base_temp)
+        expected_yield = round(req.area_pyeong * crop_spec["yield_per_pyeong"], 1)
+
+        # ----------------------------------------------------
+        # CASE A: 식재 계획 단계 (status_type == "planned")
+        # ----------------------------------------------------
+        if req.status_type == "planned":
+            recommended_plant_date = "3월 하순"
+            expected_harvest_period = "6월 하순 ~ 7월 초순"
+
+            report = (
+                f"📅 [최적 식재 시기 및 기상 분석 리포트 - {region_name}]\n"
+                f"• 선택 작물: {req.crop_name} ({crop_category}, 예측 정확도: {crop_spec['accuracy']})\n"
+                f"• 현재 지역 일평균 기온: {current_avg_temp:.1f}℃ (오늘 유효 GDD: +{today_effective_gdd:.1f}℃/일)\n"
+                f"• 추천 식재 타이밍: [{recommended_plant_date}] (경락 최고가 시기 역산)\n"
+                f"• 예상 수확 시기: {expected_harvest_period}\n"
+                f"• 예상 총 수확량: 약 {expected_yield}kg ({req.area_pyeong}평 기준)"
+            )
+
+            return CropAnalysisResponse(
+                crop_name=req.crop_name,
+                crop_category=crop_category,
+                accuracy_range=crop_spec["accuracy"],
+                accumulated_gdd=0.0,  # accumulated_temp -> accumulated_gdd 로 변경
+                target_accumulated_temp=target_temp,
+                today_effective_gdd=round(today_effective_gdd, 2),
+                gdd_progress_percent=0.0,
+                estimated_harvest_date=expected_harvest_period,  # expected_harvest_date -> estimated_harvest_date 로 변경
+                harvest_buffer_range=expected_harvest_period,
+                expected_yield_kg=expected_yield,
+                fertilizer_schedule=[],
+                fertilizer_recommendation=None, # 추가
+                notification_trigger=None,
+                analysis_report=report,
+                weather=current_weather,
+            )
+
+        # ----------------------------------------------------
+        # CASE B: 실제 재배 중 단계 (status_type == "growing")
+        # ----------------------------------------------------
+        # B-1. 과거 적산온도 누적 및 일조량/강수량 환경 보정 지연일 산출
         past_acc_temp, env_delay_days = calculate_accumulated_temp_with_environmental_factors(
             req.recent_weather or [], base_temp, crop_category
         )
-        remaining_temp = max(0.0, target_temp - past_acc_temp)
+        remaining_gdd = max(0.0, target_temp - past_acc_temp)
+        progress_percent = min(100.0, round((past_acc_temp / target_temp) * 100, 2)) if target_temp > 0 else 0.0
 
-        # 2. 미래 기온 예측 (LSTM / Fallback)
+        # B-2. 미래 기온 예측 (LSTM 예측 모델 / Fallback 사용)
         predicted_future_temps = predictor.predict_future_temps(
             recent_weather=req.recent_weather or [],
-            base_avg_temp=weather["avg_temp"],
+            base_avg_temp=current_avg_temp,
         )
 
         current_gdd_sum = 0.0
@@ -456,46 +633,51 @@ async def analyze_crop(req: CropAnalysisRequest):
             daily_gdd = max(0.0, fut_temp - base_temp)
             current_gdd_sum += daily_gdd
             days_to_harvest = idx
-            if current_gdd_sum >= remaining_temp:
+            if current_gdd_sum >= remaining_gdd:
                 break
 
-        if current_gdd_sum < remaining_temp and len(predicted_future_temps) > 0:
+        # 예측 기간을 초과하는 경우 평균 GDD로 잔여 일수 추정
+        if current_gdd_sum < remaining_gdd and len(predicted_future_temps) > 0:
             avg_future_gdd = max(1.0, current_gdd_sum / len(predicted_future_temps))
-            extra_days = int((remaining_temp - current_gdd_sum) / avg_future_gdd)
+            extra_days = math.ceil((remaining_gdd - current_gdd_sum) / avg_future_gdd)
             days_to_harvest += extra_days
 
-        # 일조량/장마 패널티 지연일 합산
+        # B-3. 환경 패널티 지연일 합산 및 최종 수확일 계산
         total_days_to_harvest = days_to_harvest + env_delay_days
         expected_harvest_dt = datetime.now() + timedelta(days=total_days_to_harvest)
         expected_harvest_str = expected_harvest_dt.strftime("%Y-%m-%d")
 
-        # 3. 안전 버퍼 기간 설정 (쇼핑몰 및 문자 발송 신뢰도 확보용)
+        # B-4. 안전 발송 버퍼 범위 산출
         buffer_start = expected_harvest_dt - timedelta(days=1)
         buffer_end = expected_harvest_dt + timedelta(days=buffer_days)
         harvest_buffer_range = f"{buffer_start.strftime('%m월 %d일')} ~ {buffer_end.strftime('%m월 %d일')}"
 
-        # 4. 상태 변경 자동 이벤트 트리거 (Notification Trigger)
+        # B-5. 이전 예측 대비 수확일 변동 알림 트리거 설정
         notification_trigger = None
         if req.previous_expected_harvest_date:
             try:
                 prev_dt = datetime.strptime(req.previous_expected_harvest_date, "%Y-%m-%d")
                 diff_days = (expected_harvest_dt - prev_dt).days
                 if abs(diff_days) >= 1:
-                    notification_trigger = {
-                        "triggered": True,
-                        "diff_days": diff_days,
-                        "message": f"기상 변화로 예측 수확일이 {abs(diff_days)}일 {'연기' if diff_days > 0 else '당겨'}졌습니다.",
-                        "action": "UPDATE_SHOPPING_MALL_BANNER_AND_SMS",
-                    }
+                    action_str = "연기" if diff_days > 0 else "당겨"
+                    notification_trigger = NotificationTrigger(
+                        triggered=True,
+                        diff_days=diff_days,
+                        message=f"기상 변화로 예측 수확일이 {abs(diff_days)}일 {action_str}졌습니다.",
+                        action="UPDATE_SHOPPING_MALL_BANNER_AND_SMS"
+                    )
             except ValueError:
-                pass
+                logger.warning(f"잘못된 날짜 포맷 전달됨: {req.previous_expected_harvest_date}")
 
-        # 5. 비료 일정 계산
+        # B-6. 면적(평) 맞춤 비료 스케줄 계산
         area_ratio = req.area_pyeong / 100.0
-        plant_dt = datetime.strptime(req.plant_date, "%Y-%m-%d") if req.plant_date else datetime.now()
+        if req.plant_date and req.plant_date != "-":
+            plant_dt = datetime.strptime(req.plant_date, "%Y-%m-%d") 
+        else:
+            plant_dt = datetime.now()
         
         fertilizer_schedule = [
-            FertilizerRecommendation(
+            FertilizerScheduleItem(
                 stage=fert["stage"],
                 recommended_date=(plant_dt + timedelta(days=fert["days_offset"])).strftime("%Y-%m-%d"),
                 item_name=fert["item_name"],
@@ -506,33 +688,48 @@ async def analyze_crop(req: CropAnalysisRequest):
 
         fert_summary = "\n".join([f"  • {f.stage} ({f.recommended_date}): {f.item_name} [{f.amount_kg}kg]" for f in fertilizer_schedule])
 
+        # B-7. 통합 리포트 생성
         report = (
             f"🌱 [생육 상태 및 환경 보정 예측 리포트 - {region_name}]\n"
             f"• 작물/부류: {req.crop_name} ({crop_category} | 예측 정확도: {crop_spec['accuracy']})\n"
-            f"• 현재 누적 적산온도: {past_acc_temp:.1f}℃ / 목표 적산온도: {target_temp:.1f}℃\n"
-            f"• 일조량/강우 환경 보정: +{env_delay_days}일 숙기 지연 반영됨\n"
+            f"• 생육 진행률: {progress_percent}% (누적 GDD: {past_acc_temp:.1f}℃ / 목표: {target_temp:.1f}℃)\n"
+            f"• 일조량/강우 환경 보정: +{env_delay_days}일 숙기 지연 반영\n"
             f"• 최종 예측 수확 확정일: {expected_harvest_dt.strftime('%m월 %d일')} (약 {total_days_to_harvest}일 후)\n"
             f"• 🛡️ 쇼핑몰 권장 발송 버퍼: {harvest_buffer_range}\n"
-            f"• 예상 총 수확량: 약 {expected_yield}kg\n\n"
+            f"• 예상 총 수확량: 약 {expected_yield}kg ({req.area_pyeong}평 기준)\n\n"
             f"💊 [{req.crop_name} {req.area_pyeong}평 맞춤 비료 Schedule]\n"
             f"{fert_summary}"
+        )
+
+        # B-8. 단일 비료 추천 데이터 생성
+        current_fert_recommendation = get_fertilizer_recommendation(
+            progress_percent
         )
 
         return CropAnalysisResponse(
             crop_name=req.crop_name,
             crop_category=crop_category,
             accuracy_range=crop_spec["accuracy"],
-            accumulated_temp=past_acc_temp,
+            accumulated_gdd=round(past_acc_temp, 2),
             target_accumulated_temp=target_temp,
-            expected_harvest_date=expected_harvest_str,
+            today_effective_gdd=round(today_effective_gdd, 2),
+            gdd_progress_percent=progress_percent,
+            estimated_harvest_date=expected_harvest_str,
             harvest_buffer_range=harvest_buffer_range,
             expected_yield_kg=expected_yield,
             fertilizer_schedule=fertilizer_schedule,
+            fertilizer_recommendation=current_fert_recommendation, # 이제 변수가 정상적으로 참조됩니다.
             notification_trigger=notification_trigger,
             analysis_report=report,
             weather=current_weather,
         )
 
+    except Exception as e:
+        logger.error(f"작물 분석 처리 중 오류 발생: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"작물 생육 분석 처리 중 내부 오류가 발생했습니다: {str(e)}"
+        )
 
 if __name__ == "__main__":
     import uvicorn

@@ -7,7 +7,7 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 # 형식: postgresql://USER:PASSWORD@HOST:PORT/DB_NAME
 DATABASE_URL = os.getenv(
     "DATABASE_URL", 
-    "postgresql://postgres:password@localhost:5432/smart_farm"
+    "postgresql://postgres:1234@localhost:5432/postgres"
 )
 
 engine = create_engine(
@@ -19,3 +19,11 @@ engine = create_engine(
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+
+# DB 세션 생성
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()

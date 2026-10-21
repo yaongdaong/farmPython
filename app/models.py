@@ -1,41 +1,141 @@
-# models.py
-from sqlalchemy import Column, Integer, String, Float, Date, DateTime, ForeignKey, func
+from datetime import datetime
+from app.database import Base
+from sqlalchemy import Column, Date, DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import relationship
-from database import Base
+
 
 class Crop(Base):
-    __tablename__ = "crops"
+    __tablename__ = "crop"
 
     id = Column(Integer, primary_key=True, index=True)
-    name = Column(String(50), unique=True, nullable=False)        # 작물명 (예: 토마토, 고추)
-    base_temp = Column(Float, nullable=False, default=10.0)      # 생육 하한 온도 (Base Temp)
-    upper_temp = Column(Float, nullable=False, default=30.0)     # 생육 상한 온도 (Upper Temp)
+    farmId = Column("farmId", Integer, ForeignKey("farm.id"), nullable=False)
+    name = Column("name", String, nullable=False)
+    status = Column("status", String, nullable=False)
+    baseTemp = Column("baseTemp", Float, default=10.0, nullable=False)
+    upperTemp = Column("upperTemp", Float, default=30.0, nullable=False)
+    targetGdd = Column("targetGdd", Float, default=1500.0, nullable=False)
+    expectedYield = Column("expectedYield", Float, nullable=True)
+    plantingDate = Column("plantingDate", DateTime(timezone=True), nullable=True)
+    bloomDate = Column("bloomDate", DateTime(timezone=True), nullable=True)
+    harvestDate = Column("harvestDate", DateTime(timezone=True), nullable=True)
+    createdAt = Column("createdAt", DateTime(timezone=True), default=datetime.utcnow)
 
-    stages = relationship("CropStageGdd", back_populates="crop", cascade="all, delete-orphan")
-    logs = relationship("UserCropLog", back_populates="crop")
+    farm = relationship("Farm", back_populates="crops")
+    stages = relationship(
+        "CropStageGdd", back_populates="crop", cascade="all, delete-orphan"
+    )
+    logs = relationship(
+        "UserCropLog", back_populates="crop", cascade="all, delete-orphan"
+    )
+    farmLogs = relationship(
+        "FarmLog", back_populates="crop", cascade="all, delete-orphan"
+    )
+
 
 class CropStageGdd(Base):
     __tablename__ = "crop_stage_gdds"
 
     id = Column(Integer, primary_key=True, index=True)
-    crop_id = Column(Integer, ForeignKey("crops.id"), nullable=False)
-    stage_name = Column(String(50), nullable=False)              # 생육 단계 (예: 정식~수확, 발아~개화)
-    target_gdd = Column(Float, nullable=False)                   # 해당 단계 목표 누적 GDD
+    cropId = Column("cropId", Integer, ForeignKey("crop.id"), nullable=False)
+    stageName = Column("stageName", String, nullable=False)
+    targetGdd = Column("targetGdd", Float, nullable=False)
 
     crop = relationship("Crop", back_populates="stages")
+
 
 class UserCropLog(Base):
     __tablename__ = "user_crop_logs"
 
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, nullable=False, default=1)
-    crop_id = Column(Integer, ForeignKey("crops.id"), nullable=False)
-    
-    last_event_type = Column(String(50), default="PLANTED")       # 이벤트 유형 (PLANTED, HARVESTED 등)
-    last_event_date = Column(Date, nullable=False)                # 파종/정식일
-    accumulated_gdd_since_event = Column(Float, default=0.0)     # 누적 GDD
-    estimated_harvest_date = Column(Date, nullable=True)          # 예상 수확일
-    
-    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+    userId = Column("userId", Integer, nullable=False, default=1)
+    cropId = Column("cropId", Integer, ForeignKey("crop.id"), nullable=False)
+    lastEventType = Column("lastEventType", String, default="PLANTED")
+    lastEventDate = Column("lastEventDate", Date, nullable=False)
+    accumulatedGddSinceEvent = Column(
+        "accumulatedGddSinceEvent", Float, default=0.0
+    )
+    estimatedHarvestDate = Column("estimatedHarvestDate", Date, nullable=True)
+    updatedAt = Column("updatedAt", DateTime(timezone=True), default=datetime.utcnow)
 
     crop = relationship("Crop", back_populates="logs")
+
+
+class Farm(Base):
+    __tablename__ = "farm"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column("name", String, nullable=False)
+    address = Column("address", String, nullable=False)
+    actualArea = Column("actualArea", Float, nullable=False)
+    totalArea = Column("totalArea", Float, nullable=False)
+    gridX = Column("gridX", Integer, nullable=False)
+    gridY = Column("gridY", Integer, nullable=False)
+    plantDate = Column("plantDate", Date, nullable=True)
+    bloomDate = Column("bloomDate", Date, nullable=True)
+    statusType = Column("statusType", String, default="PLANNED")
+    growthStatus = Column("growthStatus", String, default="영농생장기")
+    accumulatedTemp = Column("accumulatedTemp", Float, default=0.0)
+    targetTemp = Column("targetTemp", Float, nullable=True)
+    baseTemp = Column("baseTemp", Float, nullable=True)
+    targetGdd = Column("targetGdd", Float, nullable=True)
+    facilityType = Column("facilityType", String, nullable=True)
+    createdAt = Column("createdAt", DateTime(timezone=True), default=datetime.utcnow)
+
+    crops = relationship(
+        "Crop", back_populates="farm", cascade="all, delete-orphan"
+    )
+    farmLogs = relationship(
+        "FarmLog", back_populates="farm", cascade="all, delete-orphan"
+    )
+    predictions = relationship(
+        "Prediction", back_populates="farm", cascade="all, delete-orphan"
+    )
+    harvests = relationship(
+        "Harvest", back_populates="farm", cascade="all, delete-orphan"
+    )
+
+
+class FarmLog(Base):
+    __tablename__ = "farmLog"
+
+    id = Column(Integer, primary_key=True, index=True)
+    farmId = Column("farmId", Integer, ForeignKey("farm.id"), nullable=True)
+    cropId = Column("cropId", Integer, ForeignKey("crop.id"), nullable=True)
+    date = Column("date", DateTime(timezone=True), nullable=False)
+    growthStage = Column("growthStage", String, nullable=False)
+    workType = Column("workType", String, nullable=False)
+    avgTemp = Column("avgTemp", Float, nullable=True)
+    memo = Column("memo", Text, nullable=False)
+    createdAt = Column("createdAt", DateTime(timezone=True), default=datetime.utcnow)
+
+    farm = relationship("Farm", back_populates="farmLogs")
+    crop = relationship("Crop", back_populates="farmLogs")
+
+
+class Prediction(Base):
+    __tablename__ = "predictions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    farmId = Column("farmId", Integer, ForeignKey("farm.id"), nullable=False)
+    predictedHarvestDate = Column("predictedHarvestDate", Date, nullable=True)
+    predictedYield = Column("predictedYield", Float, nullable=True)
+    predictedGdd = Column("predictedGdd", Float, nullable=True)
+    predictionDate = Column(
+        "predictionDate", DateTime(timezone=True), default=datetime.utcnow
+    )
+
+    farm = relationship("Farm", back_populates="predictions")
+
+
+class Harvest(Base):
+    __tablename__ = "harvests"
+
+    id = Column(Integer, primary_key=True, index=True)
+    farmId = Column("farmId", Integer, ForeignKey("farm.id"), nullable=False)
+    actualHarvestDate = Column("actualHarvestDate", Date, nullable=False)
+    actualYield = Column("actualYield", Float, nullable=False)
+    memo = Column("memo", Text, nullable=True)
+    createdAt = Column("createdAt", DateTime(timezone=True), default=datetime.utcnow)
+
+    farm = relationship("Farm", back_populates="harvests")
+
