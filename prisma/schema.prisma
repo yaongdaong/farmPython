@@ -1,3 +1,5 @@
+# prisma/schema.prisma: Prisma ORM 설정 파일입니다. (넥스트제이스나 다른 툴과의 연동 또는 데이터 모델 관리를 위해 포함된 것으로 보입니다.)
+
 datasource db {
   provider = "sqlite"
 }

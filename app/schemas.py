@@ -1,3 +1,5 @@
+# schemas.py: 프론트엔드와 주고받는 데이터의 유효성 검증(Validation) 및 구조(DTO)를 정의하는 Pydantic 모델 파일입니다.
+
 from pydantic import BaseModel, Field
 from datetime import date
 from typing import Optional

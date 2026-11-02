@@ -1,3 +1,5 @@
+# config.py: 환경 변수(env)나 애플리케이션 전역 설정 값을 관리하는 파일입니다.
+
 import os
 from pathlib import Path
 from dotenv import load_dotenv

@@ -1,4 +1,5 @@
-# scheduler.py
+# scheduler.py: 주기적으로 실행해야 하는 작업(예: 기상청 날씨 데이터 자동 수집, 알림 발송 등)을 백그라운드에서 돌리는 스케줄러 파일입니다.
+
 from datetime import datetime, timedelta
 from apscheduler.schedulers.blocking import BlockingScheduler
 from sqlalchemy.orm import Session

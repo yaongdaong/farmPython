@@ -1,4 +1,5 @@
-# init_db.py
+# init_db.py: 데이터베이스 초기화 및 초기 더미 데이터 생성용 파일입니다.
+
 from database import engine, Base, SessionLocal
 from models import Crop, CropStageGdd
 

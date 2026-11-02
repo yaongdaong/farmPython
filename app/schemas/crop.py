@@ -1,6 +1,11 @@
+# crop.py: 작물 정보 등록, 조회, 파종 데이터와 관련된 Pydantic 데이터 검증 스키마입니다.
+
 from pydantic import BaseModel, Field
 from typing import List, Optional
 
+# ==========================================
+# 1. 기상 및 영농일지 관련 스키마
+# ==========================================
 class WeatherInfo(BaseModel):
     date: Optional[str] = Field(None, description="날짜 (YYYY-MM-DD)")
     temp: float = Field(..., description="현재 기온")
@@ -11,8 +16,17 @@ class WeatherInfo(BaseModel):
     solHours: float = Field(0.0, description="일조시간 (시간)")
 
 class WeatherRequest(BaseModel):
-    location_str: str
+    location_str: str = Field(..., description="조회할 지역명")
 
+class FarmingLogItem(BaseModel):
+    log_date: str = Field(..., description="기록 일자")
+    growth_stage: str = Field(..., description="생장 단계 (예: PLANTING, BLOOMING, FRUITING, HARVEST)")
+    note: Optional[str] = Field("", description="상세 작업 내용")
+
+
+# ==========================================
+# 2. AI 분석 및 예측 요청/응답 스키마
+# ==========================================
 class CropAnalysisSchema(BaseModel):
     crop_id: str
     crop_name: str
@@ -30,6 +44,7 @@ class CropAnalysisRequest(BaseModel):
     plant_date: str = Field(..., description="정식일/파종일")
     base_temp: float = Field(..., description="생육 하한온도")
     recent_weather: List[WeatherInfo] = Field(default=[], description="과거/최근 기상 기록")
+    farming_logs: Optional[List[FarmingLogItem]] = Field(default=[], description="영농일지 기록 목록")
     previous_expected_harvest_date: Optional[str] = Field(None, description="이전 예측 수확일")
 
 class FertilizerScheduleItem(BaseModel):
@@ -68,3 +83,21 @@ class CropAnalysisResponse(BaseModel):
     notification_trigger: Optional[NotificationTrigger] = None
     analysis_report: Optional[str] = None
     weather: WeatherInfo
+
+
+# ==========================================
+# 3. 라우터 통신용 신규 요청 스키마 (알림, 계산기, 수확 예약)
+# ==========================================
+class NotificationRequest(BaseModel):
+    phoneNumber: str = Field(..., description="수신자 전화번호")
+    sigungu: str = Field(..., description="대상 지역 시군구")
+
+class FertilizerRequest(BaseModel):
+    area: float = Field(..., description="경작 면적 (평)")
+
+class HarvestScheduleRequest(BaseModel):
+    farmId: Optional[str] = Field("default-farm-id", description="농장 고유 ID")
+    cropName: str = Field(..., description="작물 이름")
+    harvestDate: str = Field(..., description="예상 수확일 (YYYY-MM-DD)")
+    expectedKg: float = Field(..., description="예상 수확량 (kg)")
+    expectedRevenue: float = Field(..., description="예상 직거래 매출액 (원)")

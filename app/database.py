@@ -1,4 +1,5 @@
-# database.py
+# database.py / db.py: 데이터베이스 연결 세션과 엔진을 설정하는 파일입니다.   
+
 import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base

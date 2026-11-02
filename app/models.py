@@ -1,6 +1,8 @@
+# models.py: 데이터베이스 테이블 구조를 정의하는 ORM 모델 파일입니다.
+
 from datetime import datetime
 from app.database import Base
-from sqlalchemy import Column, Date, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import Column, Date, DateTime, Float, ForeignKey, Integer, String, Text, Boolean
 from sqlalchemy.orm import relationship
 
 
@@ -139,3 +141,24 @@ class Harvest(Base):
 
     farm = relationship("Farm", back_populates="harvests")
 
+class HarvestReservationModel(Base):
+    __tablename__ = "harvest_reservations"
+
+    id = Column(String, primary_key=True, default=lambda: str(datetime.utcnow().timestamp()))
+    farmId = Column(String, nullable=False, default="default-farm-id")
+    cropName = Column(String, nullable=False)
+    harvestDate = Column(DateTime, nullable=False)
+    expectedKg = Column(Float, nullable=False)
+    expectedRevenue = Column(Float, nullable=False)
+    popupLinked = Column(Boolean, default=True)
+    smsSent = Column(Boolean, default=True)
+    createdAt = Column(DateTime, default=datetime.utcnow)
+
+class NotificationSubscriptionModel(Base):
+    __tablename__ = "notification_subscriptions"
+
+    id = Column(String, primary_key=True, default=lambda: str(datetime.utcnow().timestamp()))
+    phoneNumber = Column(String, nullable=False)
+    sigungu = Column(String, nullable=False)
+    isSubscribed = Column(Boolean, default=True)
+    createdAt = Column(DateTime, default=datetime.utcnow)

@@ -1,3 +1,5 @@
+# services.py: 비즈니스 로직(데이터 처리, 계산 등)을 모아둔 파일입니다.
+
 from datetime import date, timedelta
 from sqlalchemy.orm import Session
 import models, schemas
